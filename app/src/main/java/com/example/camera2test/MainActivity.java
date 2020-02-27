@@ -18,6 +18,10 @@ import android.media.ImageReader;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.TextToSpeechService;
+import android.speech.tts.UtteranceProgressListener;
+import android.speech.tts.Voice;
 import android.support.annotation.NonNull;
 import android.support.v4.content.ContextCompat;
 import android.support.v7.app.AppCompatActivity;
@@ -25,6 +29,9 @@ import android.os.Bundle;
 import android.util.Log;
 import android.util.Size;
 import android.util.SparseIntArray;
+import android.view.GestureDetector;
+import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
@@ -36,11 +43,20 @@ import android.view.textservice.TextServicesManager;
 import android.widget.Toast;
 
 import java.nio.ByteBuffer;
+import java.sql.Time;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.TimeUnit;
 
 import com.google.firebase.ml.vision.common.FirebaseVisionImageMetadata;
+import com.google.firebase.ml.vision.text.FirebaseVisionText;
+
+import org.w3c.dom.Text;
 
 public class MainActivity extends AppCompatActivity implements SpellCheckerSession.SpellCheckerSessionListener {
 
@@ -50,6 +66,10 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
 
     private final int mPreviewWidth = 1920;
     private final int mPreviewHeight = 1080;
+
+    public int elementIndex = 0;
+    public int graphicIndex = 0;
+    public TextServicesManager tsm;
 
 
     private TextureView.SurfaceTextureListener mSurfaceTextureListener = new TextureView.SurfaceTextureListener() {
@@ -124,6 +144,45 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
         }
     }
 
+    public SpellCheckerSession session;
+    Boolean isTTSComplete;
+    int ttsCount = 0, prevTTSCount = 0;
+    int indexSearched;
+    List<TextGraphic> graphicsList = new ArrayList<>();
+    int tapCount = 0;
+    private TextToSpeech tts;
+    private GestureDetector gestureDetector;
+    private ScaleGestureDetector scaleGestureDetector;
+    private StringBuilder sb = new StringBuilder();
+    private GraphicOverlay<TextGraphic> mGraphicOverlay;
+    private TextRecognizer mTextRecognizer = new TextRecognizer();
+    private int rotation;
+    private final ImageReader.OnImageAvailableListener onImageAvailableListener
+            = new ImageReader.OnImageAvailableListener() {
+        @Override
+        public void onImageAvailable(ImageReader reader) {
+            Image image = reader.acquireNextImage();
+
+            /** here i can obtain a ByteBuffer directly using image.getPlanes[0].getBuffer but i have to use this method as the textRecognizer only recognises half part of the image when used with that method.
+             * This can be due to 3 different planes as this method uses all the 3 planes but if we use the direct method we only use one plane**/
+            ByteBuffer byteBuffer = imageToByteBuffer(image);
+            byte[] bytes = new byte[byteBuffer.capacity()];
+
+            try {
+                rotation = getRotationCompensation(mCameraId);
+            } catch (CameraAccessException e) {
+                Log.d(TAG, "onImageAvailable: CameraAccessException");
+                e.printStackTrace();
+            }
+
+            mTextRecognizer.setupResolution(mPreviewWidth, mPreviewHeight);
+            mTextRecognizer.imageFromByteBuffer(byteBuffer, rotation);
+            fetchSuggestionsFor(mTextRecognizer.textOutput);
+
+
+            image.close();
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -138,11 +197,87 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
         tsm = (TextServicesManager) getSystemService(Context.TEXT_SERVICES_MANAGER_SERVICE);
         session = tsm.newSpellCheckerSession(Bundle.EMPTY, Locale.ENGLISH, this, true);
 
-        //  fetchSuggestionsFor("hello");
+        gestureDetector = new GestureDetector(this, new CaptureGestureListener());
+        scaleGestureDetector = new ScaleGestureDetector(this, new ScaleListener());
+        TextToSpeech.OnInitListener listener = new TextToSpeech.OnInitListener() {
+            @Override
+            public void onInit(int status) {
+                if (status == TextToSpeech.SUCCESS) {
+                    Log.d("TTS", "Text to speech engine started successfully.");
+                    tts.setLanguage(Locale.US);
+                    tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                        @Override
+                        public void onStart(String utteranceId) {
+                            isTTSComplete = false;
+                            Log.d("graphicText", "onDone:mProgress is Starting");
+
+                            /**What if we can just find the elements of the Line That been spoken and once we got the elements we will make a loop or a function which will add them after a couple of Seconds.
+                             * We can use the index of the elements to draw them after some seconds */
+
+
+                            Timer t = new Timer();
+                            TimerTask tt = new TimerTask() {
+                                int index = 0;
+
+                                @Override
+                                public void run() {
+                                    mGraphicOverlay.desiredGraphic = mGraphicOverlay.graphicsBox.get(graphicIndex);
+
+                                    if (mGraphicOverlay.desiredGraphic != null) {
+
+                                        if (index < mGraphicOverlay.desiredGraphic.getTextBlock().getElements().size()) {
+                                            FirebaseVisionText.Element textElement;
+                                            textElement = mGraphicOverlay.desiredGraphic.getTextBlock().getElements().get(index);
+                                            Log.d("LineLength", "element:" + textElement.getText() + " Index: " + index);
+                                            TextGraphic textGraphic = new TextGraphic(mGraphicOverlay, textElement);
+                                            mGraphicOverlay.graphicElement = textGraphic;
+                                        }
+                                        index++;
+                                    }
+                                }
+                            };
+                            t.scheduleAtFixedRate(tt, 0, 250);
+
+//                            } else {
+//                                Log.d("LineLength", "DesiredGraphic is null");
+//                            }
+
+                            if (graphicsList.size() > mGraphicOverlay.desiredGraphic.getTextBlock().getElements().size()) {
+                                graphicsList.clear();
+                            }
+                            Log.d("graphicText", "onDone:Text:" + mGraphicOverlay.desiredGraphic.getTextBlock().getText() + " | Index" + graphicIndex);
+                        }
+
+                        @Override
+                        public void onDone(String utteranceId) {
+                            isTTSComplete = true;
+                            Log.d("graphicText", "onDone:mProgress is done");
+                            graphicIndex++;
+//                            Log.d("graphicText", "Next Text:" + mGraphicOverlay.graphicsBox.get(graphicIndex).getTextBlock().getText() + " | index: " + graphicIndex);
+                        }
+
+                        @Override
+                        public void onError(String utteranceId) {
+                        }
+                    });
+                } else {
+                    Log.d("TTS", "Error starting the text to speech engine ");
+                }
+            }
+        };
+        tts = new TextToSpeech(this.getApplicationContext(), listener);
+        tts.setSpeechRate(2f);
+
     }
 
-    public TextServicesManager tsm;
-    public SpellCheckerSession session;
+    @Override
+    public boolean onTouchEvent(MotionEvent e) {
+        boolean b = scaleGestureDetector.onTouchEvent(e);
+
+        boolean c = gestureDetector.onTouchEvent(e);
+
+        return b || c || super.onTouchEvent(e);
+    }
 
     @Override
     public void onGetSuggestions(SuggestionsInfo[] results) {
@@ -206,19 +341,106 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
         }
     }
 
-    @Override
-    protected void onResume() {
-        super.onResume();
-
-        startBackgroundThread();
-        if (mTextureView.isAvailable()) {
-            setupCamera(mPreviewWidth, mPreviewHeight);
-            connectCamera();
+    /**
+     * Checks whether the text that is being spoken matches with the word being displayed
+     */
+    void isTextMatchingWithGraphic(int indexOfTextToBeCompared) {
+        String textToBeCompared = mTextRecognizer.textList.get(indexOfTextToBeCompared);
+        String graphicText = mGraphicOverlay.graphicsBox.get(graphicIndex).getTextBlock().getText();
+        if (graphicText.equals(textToBeCompared)) {
+            Log.d("TTS", "Text Matches With The Spoken Word");
         } else {
-            mTextureView.setSurfaceTextureListener(mSurfaceTextureListener);
+            Log.d("TTS", "Graphic and SpokenText Not Matching. \n textSpoken:" + textToBeCompared + " | graphicText:" + graphicText);
+            graphicIndex = graphicFinder(textToBeCompared);
         }
-        // fetchSuggestionsFor("hello");
-        mTextRecognizer.currentCount = 0;
+    }
+
+    //     what if we can check that whether  a particular textBox exists at a location or not. we will first check its previous location and then compare its location with the new updated one.
+    private boolean onTap(float rawX, float rawY) {
+
+        /**  This is to protect the value of graphicIndex to Change in a loop.If this was not implemented the value of graphicIndex changes as the loop continues
+         * So the intial value of the graphicIndex is only assigned when there is a new tap*/
+        boolean newTap = true;
+        tapCount++;
+        TextGraphic graphic = mGraphicOverlay.getGraphicAtLocation(rawX, rawY);
+        FirebaseVisionText.Line text = null;
+
+        String textForSpeech = "";
+
+        if (graphic != null) {
+            Log.d("LineLength", "Graphic is Not Null ");
+
+            text = graphic.getTextBlock();
+
+            indexSearched = textFinder(text.getText()); // here we are searching for the text in the textList so that we can get the index of the text that we tapped on.
+
+            if (graphic != null && text.getText() != null) {
+                Log.d("TTS", "text data is being spoken! " + text.getText());
+
+
+                while (indexSearched <= mGraphicOverlay.totalWords && mGraphicOverlay.totalWords != 0) { // i think the first condition is failing
+
+                    if (mTextRecognizer.textList.size() == indexSearched || indexSearched > mTextRecognizer.textList.size()) {
+                        Log.d("TTS", "No Words Found In textList or there a problem in textList. | indexSearched:" + indexSearched + "textList: Size" + mTextRecognizer.textList.size());
+                        break;
+                    }
+
+
+                    Log.d("TTS", "Next Text:" + mTextRecognizer.textList.get(indexSearched));
+
+                    if (newTap) {
+                        graphicIndex = graphicFinder(mTextRecognizer.textList.get(indexSearched));
+                    }
+
+                    // There should be a function which will regularly checks that whether the text written is equal to the text spoken.
+                    tts.speak(mTextRecognizer.textList.get(indexSearched), TextToSpeech.QUEUE_ADD, null, "DEFAULT");
+
+
+                    Log.d("TTS", "onTap: indexSearched:" + indexSearched + " | Word:" + mTextRecognizer.textList.get(indexSearched) + " | textList Length:" + mTextRecognizer.textList.size() + " | Total Words:" + mGraphicOverlay.totalWords);
+                    Log.d("TTS", "textSpoken:" + mTextRecognizer.textList.get(indexSearched) + " | graphicText:" + mGraphicOverlay.graphicsBox.get(graphicIndex).getTextBlock().getText());
+
+                    indexSearched++;
+
+                    newTap = false;
+
+                }
+
+                if (!tts.isSpeaking()) {
+                    Log.d("TTS", "Text To Speech Engine Is Not Busy");
+                }
+                Log.d("TTS", "Text:" + textForSpeech);
+                Log.d("TTS", "Done with speaking");
+
+            } else {
+                Log.d("TTS", "text data is null ");
+            }
+
+
+        } else {
+            Log.d("TTS", "No Text Detected(graphic is null) ");
+        }
+
+        return text != null;
+
+    }
+
+    private int graphicFinder(String graphicToBeSearched) {
+
+        for (int i = 0; i < mGraphicOverlay.graphicsBox.size(); i++) {
+
+            if (graphicToBeSearched.equals(mGraphicOverlay.graphicsBox.get(i).getTextBlock().getText())) {
+                Log.d("graphicText", "graphicText:" + graphicToBeSearched);
+                return i;
+            }
+
+            /** if (graphicToBeSearched.equals(mGraphicOverlay.graphicsBox.get(i))) {
+             Log.d("graphicText", "graphicText:" + graphicToBeSearched.getTextBlock().getText());
+             return i;
+             }*/
+            Log.d("graphicText", "graphicText:Not Found");
+
+        }
+        return 0;
     }
 
     @Override
@@ -232,10 +454,38 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
         }
     }
 
+    private int textFinder(String textToBeSearched) {
+
+        for (int i = 0; i < mTextRecognizer.textList.size(); i++) {
+            if (textToBeSearched.equals(mTextRecognizer.textList.get(i))) {
+                Log.d("textFinder", "textFinder: text Is Found. | TextFound:" + mTextRecognizer.textList.get(i));
+                return i;
+            }
+            Log.d("textFinder", "textFinder: text Is not Found. | TextToBeSearched:" + textToBeSearched + " | Text At Current Index:" + mTextRecognizer.textList.get(i) + " | finderCount:" + i);
+        }
+        return 0;
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        startBackgroundThread();
+        if (mTextureView.isAvailable()) {
+            setupCamera(mPreviewWidth, mPreviewHeight);
+            connectCamera();
+        } else {
+            mTextureView.setSurfaceTextureListener(mSurfaceTextureListener);
+        }
+
+        mTextRecognizer.currentCount = 0;
+        tapCount = 0;
+    }
+
     @Override
     protected void onPause() {
         closeCamera();
         stopBackgroundThread();
+        tts.stop();
         super.onPause();
     }
 
@@ -251,7 +501,8 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
         // devices it is 270 degrees. For devices with a sensor orientation of
         // 270, rotate the image an additional 180 ((270 + 270) % 360) degrees.
         CameraManager cameraManager = (CameraManager) getSystemService(Context.CAMERA_SERVICE);
-        int sensorOrientation = cameraManager
+        int sensorOrientation;
+        sensorOrientation = cameraManager
                 .getCameraCharacteristics(cameraId)
                 .get(CameraCharacteristics.SENSOR_ORIENTATION);
         rotationCompensation = (rotationCompensation + sensorOrientation + 270) % 360;
@@ -277,35 +528,6 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
         }
         return result;
     }
-
-    private GraphicOverlay mGraphicOverlay;
-    private TextRecognizer mTextRecognizer = new TextRecognizer();
-    private int rotation;
-
-    private final ImageReader.OnImageAvailableListener onImageAvailableListener
-            = new ImageReader.OnImageAvailableListener() {
-        @Override
-        public void onImageAvailable(ImageReader reader) {
-            Image image = reader.acquireNextImage();
-
-            /** here i can obtain a bytebuffer directly using image.getPlanes[0].getBuffer but i have to use this method as the textRecognizer only recognises half part of the image.
-             * This can be due to 3 different planes as this method uses all the 3 planes but if we use the direct method we only use one plane**/
-            ByteBuffer byteBuffer = imageToByteBuffer(image);
-
-            try {
-                rotation = getRotationCompensation(mCameraId);
-            } catch (CameraAccessException e) {
-                Log.d(TAG, "onImageAvailable: CameraAccessException");
-                e.printStackTrace();
-            }
-
-            mTextRecognizer.setupResolution(mPreviewWidth, mPreviewHeight);
-            mTextRecognizer.imageFromByteBuffer(byteBuffer, rotation);
-            fetchSuggestionsFor(mTextRecognizer.textOutput);
-
-            image.close();
-        }
-    };
 
     private ByteBuffer imageToByteBuffer(final Image image) {
         final Rect crop = image.getCropRect();
@@ -387,13 +609,13 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
                 int rotatedWidth = width;
                 int rotatedHeight = height;
                 if (swapRotation) {
-                    rotatedWidth = height;
+                    rotatedWidth = height; // i think this is creating problems with the landscape rotation as it is flips the rotation and we have already setup the location
                     rotatedHeight = width;
                 }
                 // mPreviewSize = chooseOptimalSize(map.getOutputSizes(SurfaceTexture.class), rotatedWidth, rotatedHeight);
                 mPreviewSize = new Size(rotatedWidth, rotatedHeight);
 
-                mImageReader = ImageReader.newInstance(mPreviewSize.getWidth(), mPreviewSize.getHeight(), ImageFormat.YUV_420_888, 1);
+                mImageReader = ImageReader.newInstance(mPreviewWidth, mPreviewHeight, ImageFormat.YUV_420_888, 1);
                 mImageReader.setOnImageAvailableListener(onImageAvailableListener, mBackgroundHandler);
 
                 // mPreviewSize = getPreferredPreviewSize(map.getOutputSizes(SurfaceTexture.class),mWidth,mHeight);
@@ -417,12 +639,74 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
                         Toast.makeText(this, "This app requires access to camera", Toast.LENGTH_SHORT).show();
                     }
                     requestPermissions(new String[]{Manifest.permission.CAMERA}, REQUEST_CAMERA_PERMISSION_RESULT);
+
                 }
             } else {
                 cameraManager.openCamera(mCameraId, mCameraDeviceStateCallback, mBackgroundHandler);
             }
         } catch (CameraAccessException e) {
             e.printStackTrace();
+        }
+    }
+
+    private class CaptureGestureListener extends GestureDetector.SimpleOnGestureListener {
+
+        @Override
+        public boolean onSingleTapConfirmed(MotionEvent e) {
+            return onTap(e.getRawX(), e.getRawY()) || super.onSingleTapConfirmed(e);
+        }
+    }
+
+    private class ScaleListener implements ScaleGestureDetector.OnScaleGestureListener {
+
+        /**
+         * Responds to scaling events for a gesture in progress.
+         * Reported by pointer motion.
+         *
+         * @param detector The detector reporting the event - use this to
+         *                 retrieve extended info about event state.
+         * @return Whether or not the detector should consider this event
+         * as handled. If an event was not handled, the detector
+         * will continue to accumulate movement until an event is
+         * handled. This can be useful if an application, for example,
+         * only wants to update scaling factors if the change is
+         * greater than 0.01.
+         */
+        @Override
+        public boolean onScale(ScaleGestureDetector detector) {
+            return false;
+        }
+
+        /**
+         * Responds to the beginning of a scaling gesture. Reported by
+         * new pointers going down.
+         *
+         * @param detector The detector reporting the event - use this to
+         *                 retrieve extended info about event state.
+         * @return Whether or not the detector should continue recognizing
+         * this gesture. For example, if a gesture is beginning
+         * with a focal point outside of a region where it makes
+         * sense, onScaleBegin() may return false to ignore the
+         * rest of the gesture.
+         */
+        @Override
+        public boolean onScaleBegin(ScaleGestureDetector detector) {
+            return true;
+        }
+
+        /**
+         * Responds to the end of a scale gesture. Reported by existing
+         * pointers going up.
+         * <p/>
+         * Once a scale has ended, {@link ScaleGestureDetector#getFocusX()}
+         * and {@link ScaleGestureDetector#getFocusY()} will return focal point
+         * of the pointers remaining on the screen.
+         *
+         * @param detector The detector reporting the event - use this to
+         *                 retrieve extended info about event state.
+         */
+        @Override
+        public void onScaleEnd(ScaleGestureDetector detector) {
         }
     }
 
@@ -493,22 +777,6 @@ public class MainActivity extends AppCompatActivity implements SpellCheckerSessi
         deviceOrientation = ORIENTATIONS.get(deviceOrientation);
         return (sensorOrientation + deviceOrientation + 360) % 360;
     }
-
-
-//    private static Size chooseOptimalSize(Size[] choices, int width, int height) {
-//        List<Size> bigEnough = new ArrayList<Size>();
-//        for (Size option : choices) {
-//            if (option.getHeight() == option.getWidth() * height / width && // i think here the mHeight is intilised by multiplying the mHeight with the option mWidth and diving the whole by the normal with.It helps in scaling the option mHeight according to the option
-//                    option.getWidth() >= width && option.getHeight() >= height) {
-//                bigEnough.add(option);
-//            }
-//        }
-//        if (bigEnough.size() > 0) {
-//            return Collections.min(bigEnough, new CompareSizeByArea());
-//        } else {
-//            return choices[0];
-//        }
-//    }
 
 
 }
